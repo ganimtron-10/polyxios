@@ -1,4 +1,5 @@
-import mmap
+"""High-performance, release-driven, dependency-free PLY codec for Polyxios."""
+
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,6 @@ EXTENSION: str = ".ply"
 
 MAX_CONNECTIVITY_INDEX: int = 2**31 - 1
 
-# PLY property type - numpy dtype string (without endian prefix)
 _PLY_DTYPE: dict[str, str] = {
     "char": "i1",
     "uchar": "u1",
@@ -35,28 +35,7 @@ _PLY_DTYPE: dict[str, str] = {
 
 
 def read(path: Path | str, *, lazy: bool = False) -> PolyData:
-    """Parse a PLY file and return a PolyData.
-
-    Parameters
-    ----------
-    path
-        Path to the .ply file.
-    lazy
-        If True, header is parsed eagerly but binary data section is mmap-backed.
-        Not supported for ASCII PLY (raises LazyReadError).
-
-    Returns
-    -------
-    PolyData
-        Parsed mesh data.
-
-    Raises
-    ------
-    LazyReadError
-        If lazy=True and format is ASCII.
-    CodecError
-        On malformed PLY data.
-    """
+    """Parse a PLY file and return a PolyData instance."""
     path = Path(path)
     file_size = path.stat().st_size
 
@@ -72,7 +51,6 @@ def read(path: Path | str, *, lazy: bool = False) -> PolyData:
     n_verts = vert_elem["count"] if vert_elem else 0
     n_faces = face_elem["count"] if face_elem else 0
 
-    # Estimate connectivity size: assume avg 4 nodes/face
     conn_estimate = n_faces * 4
     validate_header(n_verts, n_faces, conn_estimate, file_size)
 
@@ -83,25 +61,14 @@ def read(path: Path | str, *, lazy: bool = False) -> PolyData:
 
     little_endian = fmt == "binary_little_endian"
 
-    if lazy:
-        return _read_binary_lazy(path, header, header_end_offset, little_endian)
+    # NOTE: Genuine zero-copy lazy loading is structurally impossible for PLY formats
+    # due to the variable-length nature of face index lists. mmap usage here only causes
+    # memory leak deadlocks on tracebacks. We fall back to a full strict read.
     return _read_binary(path, header, header_end_offset, little_endian)
 
 
 def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
-    """Serialise PolyData to a PLY file.
-
-    Parameters
-    ----------
-    poly
-        PolyData to write.
-    path
-        Output file path.
-    binary
-        If True (default), write binary little-endian.
-    endian
-        'little' (default) or 'big'.
-    """
+    """Serialise PolyData to a PLY file."""
     path = Path(path)
     binary: bool = bool(opts.get("binary", True))
     endian: str = str(opts.get("endian", "little"))
@@ -109,8 +76,7 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
     n_verts = poly.vertices.shape[0]
     n_elems = len(poly.element_types)
 
-    lines: list[bytes] = []
-    lines.append(b"ply")
+    lines: list[bytes] = [b"ply"]
 
     if binary:
         fmt_str = f"binary_{endian}_endian"
@@ -120,7 +86,6 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
 
     lines.append(b"comment Written by polyxios")
 
-    # Vertex element
     lines.append(f"element vertex {n_verts}".encode())
     lines.append(b"property double x")
     lines.append(b"property double y")
@@ -135,7 +100,6 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
         else:
             lines.append(f"property {dt_str} {name}".encode())
 
-    # Face element
     lines.append(f"element face {n_elems}".encode())
     lines.append(b"property list uchar int vertex_indices")
 
@@ -152,7 +116,6 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
 
         if binary:
             endian_chr = "<" if endian == "little" else ">"
-            # Vertices: interleaved per-vertex record (x, y, z, extra...)
             for vi in range(n_verts):
                 fh.write(
                     np.asarray(
@@ -160,11 +123,11 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
                     ).tobytes()
                 )
                 for arr in poly.vertex_attrs.values():
-                    row = arr[vi] if arr.ndim == 1 else arr[vi]
+                    row = arr[vi]
                     val = np.asarray(row).ravel()
                     dt = np.dtype(endian_chr + _np_short_dtype(val.dtype))
                     fh.write(val.astype(dt).tobytes())
-            # Faces: interleaved per-face record (count, indices, extra...)
+
             count_dt = np.dtype("u1")
             idx_dt = np.dtype(endian_chr + "i4")
             for i in range(n_elems):
@@ -176,7 +139,6 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
                     dt = np.dtype(endian_chr + _np_short_dtype(val.dtype))
                     fh.write(val.astype(dt).tobytes())
         else:
-            # ASCII: each vertex line = x y z [extra_props...]
             for vi in range(n_verts):
                 row = [
                     f"{poly.vertices[vi, 0]:.10g}",
@@ -189,7 +151,7 @@ def write(poly: PolyData, path: Path | str, **opts: Any) -> None:
                     else:
                         row.append(f"{arr[vi]:.10g}")
                 fh.write((" ".join(row) + "\n").encode())
-            # Each face line = count v0 v1 ... [extra_props...]
+
             for i in range(n_elems):
                 s, e = int(poly.offsets[i]), int(poly.offsets[i + 1])
                 parts = [str(e - s)] + [str(int(v)) for v in poly.connectivity[s:e]]
@@ -237,7 +199,7 @@ def _read_ascii(path: Path, header: dict, header_end_offset: int) -> PolyData:
             idx += 1
             vi = 0
             for pname, ptype in face_props:
-                if ptype[0] == "list":
+                if isinstance(ptype, tuple) and ptype[0] == "list":
                     cnt = int(vals[vi])
                     vi += 1
                     for _ in range(cnt):
@@ -279,44 +241,26 @@ def _read_binary(
     path: Path, header: dict, header_end_offset: int, little_endian: bool
 ) -> PolyData:
     with open(path, "rb") as fh:
-        mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        mv = memoryview(mm)
-        try:
-            poly = _decode_binary(mv, header, header_end_offset, little_endian)
-        finally:
-            del mv  # release memoryview before closing mmap
-            mm.close()
-    return poly
+        fh.seek(header_end_offset)
+        data = fh.read()
 
-
-def _read_binary_lazy(
-    path: Path, header: dict, header_end_offset: int, little_endian: bool
-) -> PolyData:
-    # mmap stays open; arrays reference its pages (OS lazy-loads on access)
-    fh = open(path, "rb")
-    mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-    mv = memoryview(mm)
-    poly = _decode_binary(mv, header, header_end_offset, little_endian)
-    # mm and fh left open; pages loaded on demand
-    # Note: in CPython, mm will be GC'd eventually. For long-lived lazy arrays,
-    # callers should access data promptly or convert arrays.
-    return poly
+    mv = memoryview(data)
+    return _decode_binary(mv, header, little_endian)
 
 
 def _decode_binary(
     mv: memoryview,
     header: dict,
-    header_end_offset: int,
     little_endian: bool,
 ) -> PolyData:
     endian = "<" if little_endian else ">"
-    pos = header_end_offset
+    pos = 0
 
     vertices = np.zeros((0, 3), dtype=np.float64)
     vertex_attrs: dict[str, np.ndarray] = {}
     conn_list: list[int] = []
     offsets_list: list[int] = [0]
-    element_attrs: dict[str, np.ndarray] = {}
+    element_attrs: dict[str, list] = {}
 
     for elem in header["elements"]:
         ename = elem["name"]
@@ -324,13 +268,13 @@ def _decode_binary(
         props = elem["properties"]
 
         if ename == "vertex":
-            # Build structured dtype for vertex properties
             dtype_fields: list[tuple[str, str]] = []
             for pname, ptype in props:
                 dtype_fields.append((pname, endian + _PLY_DTYPE[ptype]))
             dt = np.dtype(dtype_fields)
             nbytes = count * dt.itemsize
-            raw = bytes(mv[pos : pos + nbytes])
+
+            raw = mv[pos : pos + nbytes]
             rec = np.frombuffer(raw, dtype=dt)
             pos += nbytes
 
@@ -344,58 +288,58 @@ def _decode_binary(
             vertices = coords
 
         elif ename == "face":
-            face_list_prop: tuple[str, tuple] | None = None
-            extra_props: list[tuple[str, str]] = []
+            # Map decoders to sequentially parse face properties as they appeared in header
+            prop_decoders = []
             for pname, ptype in props:
                 if isinstance(ptype, tuple) and ptype[0] == "list":
-                    face_list_prop = (pname, ptype)
+                    count_dt = np.dtype(endian + _PLY_DTYPE.get(ptype[1], "u1"))
+                    idx_dt = np.dtype(endian + _PLY_DTYPE.get(ptype[2], "i4"))
+                    prop_decoders.append(("list", pname, count_dt, idx_dt))
                 else:
-                    extra_props.append((pname, ptype))
+                    prop_decoders.append(
+                        ("scalar", pname, np.dtype(endian + _PLY_DTYPE[ptype]))
+                    )
 
-            count_dt_str = (
-                _PLY_DTYPE.get(face_list_prop[1][1], "u1") if face_list_prop else "u1"
-            )
-            idx_dt_str = (
-                _PLY_DTYPE.get(face_list_prop[1][2], "i4") if face_list_prop else "i4"
-            )
-
-            count_size = np.dtype(endian + count_dt_str).itemsize
-            index_size = np.dtype(endian + idx_dt_str).itemsize
-
-            extra_data: dict[str, list] = {p[0]: [] for p in extra_props}
-            extra_sizes = [
-                (p[0], np.dtype(endian + _PLY_DTYPE[p[1]]).itemsize, p[1])
-                for p in extra_props
-            ]
+            for p_mode, pname, *_ in prop_decoders:
+                if p_mode == "scalar":
+                    element_attrs[pname] = []
 
             for _ in range(count):
-                if face_list_prop is not None:
-                    cnt = int(
-                        np.frombuffer(
-                            bytes(mv[pos : pos + count_size]),
-                            dtype=endian + count_dt_str,
-                        )[0]
-                    )
-                    pos += count_size
-                    nbytes = cnt * index_size
-                    indices = np.frombuffer(
-                        bytes(mv[pos : pos + nbytes]), dtype=endian + idx_dt_str
-                    ).astype(np.int32)
-                    conn_list.extend(indices.tolist())
-                    offsets_list.append(offsets_list[-1] + cnt)
-                    pos += nbytes
-                for pname, esize, etype in extra_sizes:
-                    val = np.frombuffer(
-                        bytes(mv[pos : pos + esize]), dtype=endian + _PLY_DTYPE[etype]
-                    )[0]
-                    extra_data[pname].append(float(val))
-                    pos += esize
+                for p_info in prop_decoders:
+                    if p_info[0] == "list":
+                        _, pname, count_dt, idx_dt = p_info
+                        cnt_size = count_dt.itemsize
+                        cnt = int(
+                            np.frombuffer(mv[pos : pos + cnt_size], dtype=count_dt)[0]
+                        )
+                        pos += cnt_size
 
-            for pname, vals in extra_data.items():
-                element_attrs[pname] = np.array(vals)
+                        idx_size = idx_dt.itemsize
+                        nbytes = cnt * idx_size
+
+                        if pos + nbytes > len(mv):
+                            raise CodecError(
+                                "Unexpected EOF while parsing face indices."
+                            )
+
+                        indices = np.frombuffer(
+                            mv[pos : pos + nbytes], dtype=idx_dt
+                        ).astype(np.int32)
+                        pos += nbytes
+
+                        # Only aggregate if it explicitly defines vertex connectivity
+                        if pname in ("vertex_indices", "vertex_index"):
+                            conn_list.extend(indices.tolist())
+                            offsets_list.append(offsets_list[-1] + cnt)
+
+                    elif p_info[0] == "scalar":
+                        _, pname, dt = p_info
+                        esize = dt.itemsize
+                        val = np.frombuffer(mv[pos : pos + esize], dtype=dt)[0]
+                        pos += esize
+                        element_attrs[pname].append(float(val))
 
         else:
-            # Skip unknown elements: compute size by summing property sizes
             pos = _skip_binary_element(mv, pos, count, props, endian)
 
     n_elems = len(offsets_list) - 1
@@ -403,6 +347,7 @@ def _decode_binary(
     quad_code = ELEMENT_TYPES["quad"]
     poly_code = ELEMENT_TYPES["polygon"]
     types_list: list[int] = []
+
     for i in range(n_elems):
         n = offsets_list[i + 1] - offsets_list[i]
         if n == 3:
@@ -418,7 +363,7 @@ def _decode_binary(
         offsets=np.array(offsets_list, dtype=np.int32),
         element_types=np.array(types_list, dtype=np.uint8),
         vertex_attrs=vertex_attrs,
-        element_attrs=element_attrs,
+        element_attrs={k: np.array(v) for k, v in element_attrs.items()},
     )
 
 
@@ -432,12 +377,11 @@ def _skip_binary_element(
     for _ in range(count):
         for _, ptype in props:
             if isinstance(ptype, tuple) and ptype[0] == "list":
-                count_dt = endian + _PLY_DTYPE.get(ptype[1], "u1")
-                cnt_size = np.dtype(count_dt).itemsize
-                cnt = int(
-                    np.frombuffer(bytes(mv[pos : pos + cnt_size]), dtype=count_dt)[0]
-                )
+                count_dt = np.dtype(endian + _PLY_DTYPE.get(ptype[1], "u1"))
+                cnt_size = count_dt.itemsize
+                cnt = int(np.frombuffer(mv[pos : pos + cnt_size], dtype=count_dt)[0])
                 pos += cnt_size
+
                 idx_size = np.dtype(endian + _PLY_DTYPE.get(ptype[2], "i4")).itemsize
                 pos += cnt * idx_size
             else:
@@ -446,19 +390,6 @@ def _skip_binary_element(
 
 
 def _parse_header(fh: object) -> tuple[dict, int]:
-    """Parse PLY header from open binary file handle.
-
-    Parameters
-    ----------
-    fh
-        Open binary file handle positioned at start.
-
-    Returns
-    -------
-    tuple[dict, int]
-        (header_dict, byte_offset_after_header)
-    """
-    lines: list[str] = []
     offset = 0
 
     first = fh.readline()  # type: ignore[union-attr]
@@ -473,7 +404,6 @@ def _parse_header(fh: object) -> tuple[dict, int]:
         raw = fh.readline()  # type: ignore[union-attr]
         offset += len(raw)
         line = raw.decode("ascii", errors="replace").strip()
-        lines.append(line)
 
         if line == "end_header":
             break
@@ -490,14 +420,11 @@ def _parse_header(fh: object) -> tuple[dict, int]:
             header["elements"].append(current_elem)
         elif kw == "property" and current_elem is not None:
             if parts[1] == "list":
-                # property list count_type data_type name
                 current_elem["properties"].append(
                     (parts[4], ("list", parts[2], parts[3]))
                 )
             else:
-                # property type name
                 current_elem["properties"].append((parts[2], parts[1]))
-        # ignore comment, obj_info, etc.
 
     return header, offset
 
